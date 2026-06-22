@@ -1,0 +1,646 @@
+%% ================================================================
+% OBJECTIF II - N4SID 
+% Systeme SIMO : Force connue -> 6 accelerations
+%
+% Entree  : Force F(t)
+% Sorties : Acc1 ... Acc6
+%
+% Corrections :
+% - utilise directement l'ordre 38
+%% ================================================================
+
+clear; clc; close all;
+
+%% ================================================================
+% 1. Charger les donnees
+%% ================================================================
+run('main_data.m');   % doit creer DATA1 et eventuellement DATA2
+
+%% ================================================================
+% 2. Parametres
+%% ================================================================
+
+P.dsFactor    = 2;          % Fs = 8192/2 = 4096 Hz
+P.fmin        = 1;          % Hz
+P.fmax        = 1500;       % Hz
+P.Tseg        = 30;         % duree utilisee [s]
+P.trainRatio  = 0.70;       % 70% identification / 30% validation
+P.standardize = true;
+
+% Mode rapide
+P.searchOrders = false;
+P.fixedOrder   = 38;        % meilleur ordre trouve avant
+
+% Si tu veux retester des ordres, mets P.searchOrders = true
+P.orders = 34:2:40;
+
+% Validation graphique courte pour eviter l'erreur memoire
+P.plotSeconds  = 5;
+P.scoreSeconds = 5;
+
+% Options d'affichage
+P.plotFRF = true;
+P.displayMatrices = false;
+
+% Dataset 2 optionnel
+P.runDataset2 = false;      % mettre true pour Healthy + Damaged
+
+% Filtrage des modes
+P.zetaMax = 0.30;           % garder modes avec amortissement < 30 %
+
+%% ================================================================
+% 3. DATASET 1 - Healthy
+%% ================================================================
+
+RES1 = run_n4sid_dataset(DATA1, 'DATASET 1 - Healthy', P);
+
+%% ================================================================
+% 4. DATASET 2 - Damaged optionnel
+%% ================================================================
+
+RES2 = [];
+Comparison = table();
+
+if P.runDataset2 == true
+
+    if exist('DATA2','var')
+
+        RES2 = run_n4sid_dataset(DATA2, 'DATASET 2 - Damaged', P);
+
+        if ~isempty(RES1.modalTable) && ~isempty(RES2.modalTable)
+
+            n = min(height(RES1.modalTable), height(RES2.modalTable));
+
+            Comparison = table;
+            Comparison.Mode = (1:n)';
+            Comparison.Freq_Healthy_Hz = RES1.modalTable.Frequency_Hz(1:n);
+            Comparison.Freq_Damaged_Hz = RES2.modalTable.Frequency_Hz(1:n);
+            Comparison.Delta_Freq_Hz = Comparison.Freq_Damaged_Hz - Comparison.Freq_Healthy_Hz;
+            Comparison.Delta_Freq_percent = 100 * Comparison.Delta_Freq_Hz ./ Comparison.Freq_Healthy_Hz;
+
+            disp(' ');
+            disp('==============================================================');
+            disp('COMPARAISON N4SID : HEALTHY / DAMAGED');
+            disp('==============================================================');
+            disp(Comparison);
+        end
+
+    else
+        warning('DATA2 n''existe pas dans main_data.m');
+    end
+end
+
+%% ================================================================
+% 5. Sauvegarde corrigee
+%% ================================================================
+
+saveFile = save_results_safely(RES1, RES2, Comparison, P);
+
+disp(' ');
+disp('==============================================================');
+disp('FIN DU SCRIPT');
+disp('Resultats sauvegardes dans :');
+disp(saveFile);
+disp('==============================================================');
+
+
+%% =================================================================
+% FONCTION PRINCIPALE POUR UN DATASET
+%% =================================================================
+
+function RES = run_n4sid_dataset(DATA, labelName, P)
+
+    fprintf('\n==============================================================\n');
+    fprintf('%s\n', labelName);
+    fprintf('==============================================================\n');
+
+    %% Preparation des donnees
+    [z_est, z_val, z_all, Info] = prepare_iddata_for_n4sid(DATA, P, labelName);
+
+    fprintf('Fs apres downsampling = %.2f Hz\n', Info.Fs);
+    fprintf('Ts = %.8f s\n', Info.Ts);
+    fprintf('Nombre total de points utilises = %d\n', Info.N);
+    fprintf('Nombre de points identification = %d\n', Info.Nid);
+    fprintf('Nombre de points validation = %d\n', Info.Nval);
+
+    %% Options N4SID
+    opt = n4sidOptions;
+    opt.Focus = 'simulation';
+    opt.EnforceStability = true;
+    opt.InitialState = 'estimate';
+    opt.Display = 'off';
+
+    %% Identification
+    if P.searchOrders == true
+
+        disp(' ');
+        disp('Recherche du meilleur ordre N4SID...');
+
+        [bestSys, bestOrder, Summary] = search_best_order_n4sid(z_est, z_val, P, opt);
+
+    else
+
+        bestOrder = P.fixedOrder;
+
+        fprintf('\nMode rapide active : identification directe avec nx = %d\n', bestOrder);
+
+        tic;
+        bestSys = n4sid(z_est, bestOrder, opt);
+        elapsedTime = toc;
+
+        fprintf('Temps identification ordre %d = %.2f minutes\n', bestOrder, elapsedTime/60);
+
+        Summary = table;
+        Summary.Order = bestOrder;
+        Summary.Note = {'Ordre fixe utilise sans recherche'};
+    end
+
+    %% Validation graphique courte
+    z_val_plot = crop_iddata(z_val, P.plotSeconds);
+
+    cmpOpt = compareOptions('InitialCondition','zero');
+
+    figure('Name', ['Validation N4SID - ' labelName]);
+    compare(z_val_plot, bestSys, cmpOpt);
+    title(['Validation N4SID - ' labelName ' - ordre = ' num2str(bestOrder)]);
+
+    %% Calcul du fit court
+    [~, fitShort] = compare(z_val_plot, bestSys, cmpOpt);
+    fitShort = fitShort(:);
+
+    FitTable = table;
+    FitTable.Output = z_val_plot.OutputName(:);
+    FitTable.Fit_percent = fitShort;
+
+    disp(' ');
+    disp('===== Fit sur la fenetre courte de validation =====');
+    disp(FitTable);
+
+    fprintf('Mean fit court = %.3f %%\n', mean(fitShort,'omitnan'));
+
+    %% Extraction matrices
+    A_id = bestSys.A;
+    B_id = bestSys.B;
+    C_id = bestSys.C;
+    D_id = bestSys.D;
+    K_id = bestSys.K;
+
+    disp(' ');
+    disp('===== Modele N4SID final =====');
+    fprintf('Modele N4SID identifie avec succes.\n');
+    fprintf('Ordre du modele nx = %d\n', bestOrder);
+    fprintf('Ts = %.8f s\n', bestSys.Ts);
+
+    fprintf('Taille A = %d x %d\n', size(A_id,1), size(A_id,2));
+    fprintf('Taille B = %d x %d\n', size(B_id,1), size(B_id,2));
+    fprintf('Taille C = %d x %d\n', size(C_id,1), size(C_id,2));
+    fprintf('Taille D = %d x %d\n', size(D_id,1), size(D_id,2));
+    fprintf('Taille K = %d x %d\n', size(K_id,1), size(K_id,2));
+
+    if P.displayMatrices == true
+        disp('Matrice A :'); disp(A_id);
+        disp('Matrice B :'); disp(B_id);
+        disp('Matrice C :'); disp(C_id);
+        disp('Matrice D :'); disp(D_id);
+        disp('Matrice K :'); disp(K_id);
+    end
+
+    %% Extraction des parametres modaux
+    modalTable = extract_modes_from_n4sid(bestSys, P.fmin, P.fmax, P.zetaMax);
+
+    disp(' ');
+    disp('===== Parametres modaux estimes par N4SID =====');
+    disp(modalTable);
+
+    %% Comparaison FRF experimentale / modele N4SID
+    if P.plotFRF == true
+        plot_frf_exp_vs_n4sid(z_all, bestSys, labelName, P);
+    end
+
+    %% Stockage
+    RES.label = labelName;
+    RES.Info = Info;
+    RES.SummaryOrders = Summary;
+    RES.bestOrder = bestOrder;
+    RES.fitShort = FitTable;
+    RES.meanFitShort = mean(fitShort,'omitnan');
+    RES.sys = bestSys;
+    RES.A = A_id;
+    RES.B = B_id;
+    RES.C = C_id;
+    RES.D = D_id;
+    RES.K = K_id;
+    RES.modalTable = modalTable;
+
+end
+
+
+%% =================================================================
+% RECHERCHE DU MEILLEUR ORDRE
+%% =================================================================
+
+function [bestSys, bestOrder, Summary] = search_best_order_n4sid(z_est, z_val, P, opt)
+
+    orders = P.orders(:);
+
+    Summary = table;
+    Summary.Order = orders;
+    Summary.MeanFit_percent = nan(length(orders),1);
+    Summary.MinFit_percent  = nan(length(orders),1);
+    Summary.MaxFit_percent  = nan(length(orders),1);
+
+    z_score = crop_iddata(z_val, P.scoreSeconds);
+    cmpOpt = compareOptions('InitialCondition','zero');
+
+    bestScore = -inf;
+    bestSys = [];
+    bestOrder = NaN;
+
+    for k = 1:length(orders)
+
+        nx = orders(k);
+
+        try
+            tic;
+            sys_tmp = n4sid(z_est, nx, opt);
+            timeOrder = toc;
+
+            [~, fit_tmp] = compare(z_score, sys_tmp, cmpOpt);
+            fit_tmp = fit_tmp(:);
+
+            meanFit = mean(fit_tmp,'omitnan');
+            minFit  = min(fit_tmp);
+            maxFit  = max(fit_tmp);
+
+            Summary.MeanFit_percent(k) = meanFit;
+            Summary.MinFit_percent(k)  = minFit;
+            Summary.MaxFit_percent(k)  = maxFit;
+
+            fprintf('Ordre %2d : Mean fit = %8.3f %% | Min = %8.3f %% | Max = %8.3f %% | Temps = %.2f min\n', ...
+                    nx, meanFit, minFit, maxFit, timeOrder/60);
+
+            if meanFit > bestScore
+                bestScore = meanFit;
+                bestSys = sys_tmp;
+                bestOrder = nx;
+            end
+
+            clear sys_tmp;
+
+        catch ME
+            fprintf('Ordre %2d : ERREUR -> %s\n', nx, ME.message);
+        end
+    end
+
+    disp(' ');
+    disp('===== Resume des ordres testes =====');
+    disp(Summary);
+
+    fprintf('\nMeilleur ordre choisi : nx = %d\n', bestOrder);
+    fprintf('Mean fit validation courte = %.3f %%\n', bestScore);
+
+end
+
+
+%% =================================================================
+% PREPARATION DES DONNEES
+%% =================================================================
+
+function [z_est, z_val, z_all, Info] = prepare_iddata_for_n4sid(DATA, P, labelName)
+
+    %% Recuperation
+    F = DATA.F(:);
+    Y = DATA.acc;
+    Fs0 = DATA.Fs;
+
+    %% Orientation
+    if size(Y,1) ~= length(F) && size(Y,2) == length(F)
+        Y = Y.';
+    end
+
+    %% Meme longueur
+    N0 = min(length(F), size(Y,1));
+    F = F(1:N0);
+    Y = Y(1:N0,:);
+
+    %% Suppression NaN / Inf
+    valid = isfinite(F) & all(isfinite(Y),2);
+    F = F(valid);
+    Y = Y(valid,:);
+
+    %% Suppression moyenne
+    F = detrend(F, 'constant');
+    Y = detrend(Y, 'constant');
+
+    %% Downsampling
+    Fs = Fs0 / P.dsFactor;
+    Ts = 1/Fs;
+
+    if Fs/2 < P.fmax
+        error('Fs apres downsampling trop faible. Diminuer P.dsFactor.');
+    end
+
+    if P.dsFactor > 1
+
+        F_ds = decimate(F, P.dsFactor, 'fir');
+
+        ny = size(Y,2);
+        Y_cell = cell(1,ny);
+        Lmin = length(F_ds);
+
+        for i = 1:ny
+            Yi = decimate(Y(:,i), P.dsFactor, 'fir');
+            Y_cell{i} = Yi;
+            Lmin = min(Lmin, length(Yi));
+        end
+
+        F = F_ds(1:Lmin);
+
+        Y_ds = zeros(Lmin, ny);
+
+        for i = 1:ny
+            Yi = Y_cell{i};
+            Y_ds(:,i) = Yi(1:Lmin);
+        end
+
+        Y = Y_ds;
+    end
+
+    %% Utiliser seulement Tseg secondes
+    Nmax = min(length(F), round(P.Tseg * Fs));
+
+    F = F(1:Nmax);
+    Y = Y(1:Nmax,:);
+
+    %% Normalisation
+    Scale.uMean = mean(F);
+    Scale.uStd  = std(F);
+
+    if Scale.uStd == 0
+        Scale.uStd = 1;
+    end
+
+    Scale.yMean = mean(Y,1);
+    Scale.yStd  = std(Y,0,1);
+    Scale.yStd(Scale.yStd == 0) = 1;
+
+    if P.standardize == true
+
+        U_id = (F - Scale.uMean) ./ Scale.uStd;
+
+        Y_id = bsxfun(@minus, Y, Scale.yMean);
+        Y_id = bsxfun(@rdivide, Y_id, Scale.yStd);
+
+    else
+
+        U_id = F;
+        Y_id = Y;
+
+    end
+
+    %% Separation identification / validation
+    N = length(U_id);
+    Nid = floor(P.trainRatio * N);
+
+    U_est = U_id(1:Nid,:);
+    Y_est = Y_id(1:Nid,:);
+
+    U_val = U_id(Nid+1:end,:);
+    Y_val = Y_id(Nid+1:end,:);
+
+    %% Creation iddata
+    z_est = iddata(Y_est, U_est, Ts);
+    z_val = iddata(Y_val, U_val, Ts);
+    z_all = iddata(Y_id, U_id, Ts);
+
+    ny = size(Y_id,2);
+    outNames = cell(1,ny);
+
+    for i = 1:ny
+        outNames{i} = ['Acc' num2str(i)];
+    end
+
+    z_est.InputName = {'Force'};
+    z_val.InputName = {'Force'};
+    z_all.InputName = {'Force'};
+
+    z_est.OutputName = outNames;
+    z_val.OutputName = outNames;
+    z_all.OutputName = outNames;
+
+    z_est.TimeUnit = 'seconds';
+    z_val.TimeUnit = 'seconds';
+    z_all.TimeUnit = 'seconds';
+
+    %% Infos
+    Info.label = labelName;
+    Info.Fs0 = Fs0;
+    Info.Fs = Fs;
+    Info.Ts = Ts;
+    Info.N = N;
+    Info.Nid = Nid;
+    Info.Nval = N - Nid;
+    Info.Scale = Scale;
+
+end
+
+
+%% =================================================================
+% COUPER UN IDDATA SUR UNE DUREE COURTE
+%% =================================================================
+
+function zc = crop_iddata(z, Tseconds)
+
+    Y = z.OutputData;
+    U = z.InputData;
+    Ts = z.Ts;
+
+    Nplot = min(size(Y,1), round(Tseconds / Ts));
+
+    Yc = Y(1:Nplot,:);
+    Uc = U(1:Nplot,:);
+
+    zc = iddata(Yc, Uc, Ts);
+
+    zc.InputName = z.InputName;
+    zc.OutputName = z.OutputName;
+    zc.TimeUnit = z.TimeUnit;
+
+end
+
+
+%% =================================================================
+% EXTRACTION DES MODES DEPUIS LES POLES
+%% =================================================================
+
+function modalTable = extract_modes_from_n4sid(sys, fmin, fmax, zetaMax)
+
+    A = sys.A;
+    Ts = sys.Ts;
+
+    lambda = eig(A);          % poles discrets
+    s = log(lambda) / Ts;     % conversion vers poles continus
+
+    freq_Hz = abs(imag(s)) / (2*pi);
+
+    den = abs(s);
+    den(den == 0) = NaN;
+
+    zeta = -real(s) ./ den;
+
+    valid = imag(s) > 0 & ...
+            freq_Hz >= fmin & ...
+            freq_Hz <= fmax & ...
+            zeta > 0 & ...
+            zeta < zetaMax & ...
+            abs(lambda) < 1.001;
+
+    freq_Hz = freq_Hz(valid);
+    zeta = zeta(valid);
+
+    [freq_Hz, idx] = sort(freq_Hz);
+    zeta = zeta(idx);
+
+    modalTable = table;
+    modalTable.Mode = (1:length(freq_Hz))';
+    modalTable.Frequency_Hz = freq_Hz(:);
+    modalTable.Damping_percent = 100*zeta(:);
+
+end
+
+
+%% =================================================================
+% FRF EXPERIMENTALE VS FRF MODELE N4SID
+%% =================================================================
+
+function plot_frf_exp_vs_n4sid(z_all, sys, labelName, P)
+
+    U = z_all.InputData;
+    Y = z_all.OutputData;
+    Ts = z_all.Ts;
+    Fs = 1/Ts;
+
+    N = length(U);
+    ny = size(Y,2);
+
+    %% Parametres Welch
+    winLength = min(8192, floor(N/8));
+
+    if winLength < 512
+        winLength = min(512, floor(N/2));
+    end
+
+    nfft = 2^nextpow2(max(1024, winLength));
+
+    win = hann(winLength, 'periodic');
+    noverlap = round(0.5 * winLength);
+
+    %% FRF experimentale
+    [H1, f] = tfestimate(U, Y(:,1), win, noverlap, nfft, Fs);
+
+    Hexp = zeros(length(f), ny);
+    Hexp(:,1) = H1;
+
+    for i = 2:ny
+        [Hi, ~] = tfestimate(U, Y(:,i), win, noverlap, nfft, Fs);
+        Hexp(:,i) = Hi;
+    end
+
+    idx = f >= P.fmin & f <= P.fmax;
+
+    fplot = f(idx);
+    Hexp_plot = Hexp(idx,:);
+
+    %% FRF du modele N4SID
+    w = 2*pi*fplot;
+
+    Hmodel_raw = freqresp(sys, w);
+    Hmodel_raw = squeeze(Hmodel_raw);
+
+    if size(Hmodel_raw,1) == ny
+        Hmodel = Hmodel_raw.';
+    elseif size(Hmodel_raw,2) == ny
+        Hmodel = Hmodel_raw;
+    else
+        error('Dimension inattendue de Hmodel_raw.');
+    end
+
+    %% Plot
+    figure('Name', ['FRF Experimentale vs N4SID - ' labelName]);
+
+    for i = 1:ny
+
+        subplot(3,2,i);
+
+        plot(fplot, 20*log10(abs(Hexp_plot(:,i))), 'LineWidth', 1.0);
+        hold on;
+
+        plot(fplot, 20*log10(abs(Hmodel(:,i))), '--', 'LineWidth', 1.0);
+
+        grid on;
+        xlabel('Frequency [Hz]');
+        ylabel('|H(f)| [dB]');
+        title(['Acc' num2str(i)]);
+        legend('FRF experimentale', 'Modele N4SID');
+
+    end
+
+    sgtitle(['FRF experimentale vs modele N4SID - ' labelName]);
+
+end
+
+
+%% =================================================================
+% SAUVEGARDE SECURISEE
+%% =================================================================
+
+function saveFile = save_results_safely(RES1, RES2, Comparison, P)
+
+    %% Dossier de sauvegarde
+    if ispc && ~isempty(getenv('USERPROFILE'))
+        baseDir = fullfile(getenv('USERPROFILE'), 'Documents');
+    else
+        baseDir = pwd;
+    end
+
+    outDir = fullfile(baseDir, 'N4SID_results');
+
+    if ~exist(outDir, 'dir')
+        mkdir(outDir);
+    end
+
+    saveFile = fullfile(outDir, 'Resultats_ObjectifII_N4SID_corrige.mat');
+
+    %% Essai de sauvegarde
+    try
+
+        save(saveFile, 'RES1', 'RES2', 'Comparison', 'P', '-v7.3');
+
+    catch ME
+
+        warning('Sauvegarde impossible dans Documents. Message : %s', ME.message);
+
+        %% Sauvegarde alternative dans le dossier courant
+        outDir2 = fullfile(pwd, 'N4SID_results');
+
+        if ~exist(outDir2, 'dir')
+            mkdir(outDir2);
+        end
+
+        saveFile = fullfile(outDir2, 'Resultats_ObjectifII_N4SID_corrige.mat');
+
+        try
+            save(saveFile, 'RES1', 'RES2', 'Comparison', 'P', '-v7.3');
+
+        catch ME2
+
+            warning('Sauvegarde impossible dans le dossier courant. Message : %s', ME2.message);
+
+            %% Derniere solution : dossier temporaire MATLAB
+            saveFile = fullfile(tempdir, 'Resultats_ObjectifII_N4SID_corrige.mat');
+            save(saveFile, 'RES1', 'RES2', 'Comparison', 'P', '-v7.3');
+
+        end
+    end
+
+end
