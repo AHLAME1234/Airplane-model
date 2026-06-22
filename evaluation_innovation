@@ -1,0 +1,203 @@
+%% ================================================================
+% ANALYSE TEMPORELLE DES INNOVATIONS e(t)
+% e(t) = y_mesure(t) - y_estime_Kalman(t)
+%% ================================================================
+
+clear; clc; close all;
+
+%% ================================================================
+% 1. Charger les resultats Kalman
+%% ================================================================
+
+load('C:\Users\pc\Documents\Kalman_results\Kalman_results_from_N4SID.mat');
+
+t = KalmanResults.t(:);
+E = KalmanResults.Innov_phys;   % innovations en unites physiques [N x 6]
+
+ny = size(E,2);
+
+Ts = mean(diff(t));
+Fs = 1/Ts;
+
+fprintf('Nombre de points = %d\n', length(t));
+fprintf('Fs = %.2f Hz\n', Fs);
+
+% Fenetre pour le RMS glissant
+windowTime    = 0.2;                              % secondes
+windowSamples = max(1, round(windowTime * Fs));
+
+%% ================================================================
+% 2. Innovations par capteur - fenetre courte
+%% ================================================================
+
+Tplot   = 5;   % secondes
+idxPlot = t <= Tplot;
+
+figure('Name','Innovation e(t) - fenetre courte','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t(idxPlot), E(idxPlot,i), 'LineWidth', 0.8);
+    yline(0,'--');
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['e_{Acc' num2str(i) '}']);
+    title(['Innovation Acc' num2str(i)]);
+end
+
+sgtitle('Evolution temporelle des innovations e(t)');
+
+%% ================================================================
+% 3. Innovations par capteur - signal complet (sous-echantillonne)
+%% ================================================================
+
+maxPoints = 8000;
+step      = max(1, floor(length(t)/maxPoints));
+
+t_ds = t(1:step:end);
+E_ds = E(1:step:end,:);
+
+figure('Name','Innovation e(t) - signal complet reduit','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t_ds, E_ds(:,i), 'LineWidth', 0.8);
+    yline(0,'--');
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['e_{Acc' num2str(i) '}']);
+    title(['Innovation Acc' num2str(i) ' - full time']);
+end
+
+sgtitle('Evolution globale des innovations');
+
+%% ================================================================
+% 4. RMS glissant par capteur
+% Permet de voir si l'erreur augmente ou diminue avec le temps
+%% ================================================================
+
+E_rms_moving = sqrt(movmean(E.^2, windowSamples, 1));
+
+figure('Name','RMS glissant des innovations','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t_ds, E_rms_moving(1:step:end,i), 'LineWidth', 1.0);
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['RMS e_{Acc' num2str(i) '}']);
+    title(['Moving RMS innovation Acc' num2str(i)]);
+end
+
+sgtitle(['RMS glissant des innovations - fenetre = ' num2str(windowTime) ' s']);
+
+%% ================================================================
+% 5. Indicateur global de l'innovation
+%
+% Chaque innovation est normalisee par son propre RMS avant la somme,
+% pour eviter que le capteur le plus bruyant (Acc1) ecrase la courbe.
+% C'est CETTE definition unique qui sert d'indicateur global.
+%% ================================================================
+
+% Normalisation par capteur
+E_n = zeros(size(E));
+for i = 1:ny
+    rms_i = rms(E(:,i));
+    if rms_i == 0
+        rms_i = 1;
+    end
+    E_n(:,i) = E(:,i) ./ rms_i;
+end
+
+% Indicateur global = norme euclidienne des innovations normalisees
+E_global     = sqrt(sum(E_n.^2, 2));
+E_global_RMS = sqrt(movmean(E_global.^2, windowSamples));
+
+% --- Courbe instantanee + RMS glissant ---
+figure('Name','Indicateur global de l innovation','Color','w');
+
+plot(t_ds, E_global(1:step:end), 'LineWidth', 0.8);
+hold on;
+plot(t_ds, E_global_RMS(1:step:end), 'LineWidth', 1.8);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Indicateur global ||e(t)||  (normalise)');
+legend('Innovation globale instantanee', 'RMS glissant');
+title('Evolution globale de l''innovation Kalman');
+
+% --- Version lisse seule (pour comparaison Healthy / Damaged) ---
+figure('Name','Indicateur global Kalman - courbe lisse','Color','w');
+
+plot(t_ds, E_global_RMS(1:step:end), 'LineWidth', 2);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Global innovation index');
+title('Indicateur global de l''innovation Kalman (RMS glissant)');
+figure('Name','Indicateur global Kalman - courbe lisse','Color','w');
+
+plot(t_ds, E_global_RMS(1:step:end), 'LineWidth', 2);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Global innovation index');
+title('Indicateur global de l''innovation Kalman (RMS glissant)');
+
+%% ================================================================
+% 6. Statistiques par capteur
+%% ================================================================
+
+InnovationTable = table;
+InnovationTable.Accelerometer = (1:ny)';
+InnovationTable.Mean_e   = mean(E,1,'omitnan').';
+InnovationTable.Std_e    = std(E,0,1,'omitnan').';
+InnovationTable.RMS_e    = rms(E,1).';
+InnovationTable.MaxAbs_e = max(abs(E),[],1).';
+
+disp(' ');
+disp('===== Statistiques des innovations (par capteur) =====');
+disp(InnovationTable);
+
+%% ================================================================
+% 7. Statistiques de l'indicateur global
+%% ================================================================
+
+GlobalInnovationTable = table;
+GlobalInnovationTable.Mean_Global = mean(E_global);
+GlobalInnovationTable.RMS_Global  = rms(E_global);
+GlobalInnovationTable.Max_Global  = max(E_global);
+
+disp(' ');
+disp('===== Statistiques de l indicateur global =====');
+disp(GlobalInnovationTable);
+
+%% ================================================================
+% 8. Sauvegarde
+%% ================================================================
+
+InnovationAnalysis.t            = t;
+InnovationAnalysis.E            = E;
+InnovationAnalysis.E_rms_moving = E_rms_moving;
+InnovationAnalysis.E_global     = E_global;
+InnovationAnalysis.E_global_RMS = E_global_RMS;
+InnovationAnalysis.InnovationTable       = InnovationTable;
+InnovationAnalysis.GlobalInnovationTable = GlobalInnovationTable;
+
+outDir = fullfile(getenv('USERPROFILE'), 'Documents', 'Kalman_results');
+
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+saveFile = fullfile(outDir, 'Innovation_analysis_Kalman.mat');
+
+save(saveFile, 'InnovationAnalysis', '-v7.3');
+
+fprintf('\nAnalyse des innovations sauvegardee dans :\n%s\n', saveFile);
