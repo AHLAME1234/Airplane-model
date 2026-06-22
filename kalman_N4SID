@@ -1,0 +1,287 @@
+%% ================================================================
+% FILTRE DE KALMAN A PARTIR DU MODELE N4SID
+%
+% Modele deja identifie :
+% x(k+1) = A x(k) + B u(k) + K e(k)
+% y(k)   = C x(k) + D u(k) + e(k)
+%
+% Entree  : Force
+% Sorties : 6 accelerations
+%% ================================================================
+
+clear; clc; close all;
+
+%% ================================================================
+% 1. Charger les donnees et le modele N4SID
+%% ================================================================
+
+run('main_data.m');   % doit creer DATA1
+
+load('C:\Users\pc\OneDrive\Dokumenty\N4SID_results\Resultats_ObjectifII_N4SID_corrige.mat');
+
+% Parametres (doivent etre coherents avec le N4SID)
+P.dsFactor = 2;     % IMPERATIF : identique au N4SID (Fs = 8192/2 = 4096 Hz)
+P.Tseg     = 120;   % duree appliquee pour Kalman : 30, 60, 120, etc.
+
+% Modele N4SID Healthy
+sys = RES1.sys;
+
+A = sys.A;
+B = sys.B;
+C = sys.C;
+D = sys.D;
+K = sys.K;
+Ts = sys.Ts;
+
+fprintf('Modele charge avec succes.\n');
+fprintf('Taille A = %d x %d\n', size(A,1), size(A,2));
+fprintf('Taille B = %d x %d\n', size(B,1), size(B,2));
+fprintf('Taille C = %d x %d\n', size(C,1), size(C,2));
+fprintf('Taille D = %d x %d\n', size(D,1), size(D,2));
+fprintf('Taille K = %d x %d\n', size(K,1), size(K,2));
+
+%% ================================================================
+% 2. Preparer les donnees comme pendant N4SID
+%% ================================================================
+
+% On utilise les memes parametres que l'identification
+DATA = DATA1;
+
+[U, Y, Info] = prepare_data_for_kalman(DATA, P, RES1.Info.Scale);
+
+% U : force normalisee
+% Y : accelerations normalisees
+
+N = size(Y,1);
+ny = size(Y,2);
+nx = size(A,1);
+
+t = (0:N-1)' * Ts;
+
+fprintf('Nombre de points utilises pour Kalman = %d\n', N);
+
+%% ================================================================
+% 3. Filtre de Kalman / observateur avec le gain K du modele N4SID
+%% ================================================================
+
+xhat = zeros(nx,1);
+
+Xhat = zeros(N,nx);
+Yhat = zeros(N,ny);
+Innov = zeros(N,ny);
+
+for k = 1:N
+
+    uk = U(k,:)';
+    yk = Y(k,:)';
+
+    % Sortie estimee
+    yhat = C*xhat + D*uk;
+
+    % Innovation = mesure - estimation
+    e = yk - yhat;
+
+    % Sauvegarde
+    Xhat(k,:) = xhat.';
+    Yhat(k,:) = yhat.';
+    Innov(k,:) = e.';
+
+    % Mise a jour de l'etat
+    xhat = A*xhat + B*uk + K*e;
+
+end
+
+%% ================================================================
+% 4. Retour aux unites physiques
+%% ================================================================
+
+Y_phys = Y .* Info.Scale.yStd + Info.Scale.yMean;
+Yhat_phys = Yhat .* Info.Scale.yStd + Info.Scale.yMean;
+Innov_phys = Innov .* Info.Scale.yStd;
+
+%% ================================================================
+% 5. Calcul du fit
+%% ================================================================
+
+Fit = zeros(ny,1);
+
+for i = 1:ny
+    y = Y_phys(:,i);
+    yh = Yhat_phys(:,i);
+
+    Fit(i) = 100 * (1 - norm(y - yh) / norm(y - mean(y)));
+end
+
+FitTable = table;
+FitTable.Accelerometer = (1:ny)';
+FitTable.Fit_percent = Fit;
+
+disp(' ');
+disp('===== Fit Kalman / N4SID =====');
+disp(FitTable);
+
+fprintf('Mean fit = %.2f %%\n', mean(Fit,'omitnan'));
+
+%% ================================================================
+% 6. Plot mesure vs estimation sur quelques secondes
+%% ================================================================
+
+Tplot = 5;   % secondes
+Nplot = min(N, round(Tplot/Ts));
+
+figure('Name','Kalman: measured vs estimated accelerations','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t(1:Nplot), Y_phys(1:Nplot,i), 'LineWidth', 0.8);
+    hold on;
+    plot(t(1:Nplot), Yhat_phys(1:Nplot,i), '--', 'LineWidth', 1.0);
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['Acc' num2str(i)]);
+    title(['Acc' num2str(i) ' - Fit = ' num2str(Fit(i),'%.1f') ' %']);
+    legend('Measured', 'Kalman estimated');
+end
+
+sgtitle('Kalman filter based on N4SID model');
+
+%% ================================================================
+% 7. Plot innovation / erreur
+%% ================================================================
+
+figure('Name','Kalman innovation','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t(1:Nplot), Innov_phys(1:Nplot,i), 'LineWidth', 0.8);
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['e Acc' num2str(i)]);
+    title(['Innovation Acc' num2str(i)]);
+end
+
+sgtitle('Innovation e(k) = measured - estimated');
+
+%% ================================================================
+% 8. Plot quelques etats internes estimes
+%% ================================================================
+
+figure('Name','Estimated internal states','Color','w');
+
+nStatesPlot = min(6,nx);
+
+for i = 1:nStatesPlot
+    subplot(nStatesPlot,1,i);
+
+    plot(t(1:Nplot), Xhat(1:Nplot,i), 'LineWidth', 0.8);
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['x_' num2str(i)]);
+    title(['Estimated state x_' num2str(i)]);
+end
+
+sgtitle('Estimated internal states of N4SID model');
+
+%% ================================================================
+% 9. Sauvegarde
+%% ================================================================
+
+KalmanResults.t = t;
+KalmanResults.Y_phys = Y_phys;
+KalmanResults.Yhat_phys = Yhat_phys;
+KalmanResults.Innov_phys = Innov_phys;
+KalmanResults.Xhat = Xhat;
+KalmanResults.FitTable = FitTable;
+
+outDir = fullfile(getenv('USERPROFILE'), 'Documents', 'Kalman_results');
+
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+saveFile = fullfile(outDir, 'Kalman_results_from_N4SID.mat');
+
+save(saveFile, 'KalmanResults', '-v7.3');
+
+fprintf('Kalman termine.\n');
+fprintf('Resultats sauvegardes dans :\n%s\n', saveFile);
+
+disp(' ');
+disp('Kalman termine.');
+disp('Resultats sauvegardes dans Kalman_results_from_N4SID.mat');
+
+%% =================================================================
+% FONCTION LOCALE : preparation des donnees
+%% =================================================================
+
+function [U_id, Y_id, Info] = prepare_data_for_kalman(DATA, P, Scale)
+
+    F = DATA.F(:);
+    Y = DATA.acc;
+    Fs0 = DATA.Fs;
+
+    if size(Y,1) ~= length(F) && size(Y,2) == length(F)
+        Y = Y.';
+    end
+
+    N0 = min(length(F), size(Y,1));
+    F = F(1:N0);
+    Y = Y(1:N0,:);
+
+    valid = isfinite(F) & all(isfinite(Y),2);
+    F = F(valid);
+    Y = Y(valid,:);
+
+    F = detrend(F, 'constant');
+    Y = detrend(Y, 'constant');
+
+    Fs = Fs0 / P.dsFactor;
+
+    if P.dsFactor > 1
+
+        Fd = decimate(F, P.dsFactor, 'fir');
+
+        ny = size(Y,2);
+        Y_cell = cell(1,ny);
+        Lmin = length(Fd);
+
+        for i = 1:ny
+            Yi = decimate(Y(:,i), P.dsFactor, 'fir');
+            Y_cell{i} = Yi;
+            Lmin = min(Lmin, length(Yi));
+        end
+
+        F = Fd(1:Lmin);
+
+        Y_ds = zeros(Lmin,ny);
+
+        for i = 1:ny
+            Yi = Y_cell{i};
+            Y_ds(:,i) = Yi(1:Lmin);
+        end
+
+        Y = Y_ds;
+    end
+
+    % Meme duree que pendant N4SID
+    Nmax = min(length(F), round(P.Tseg * Fs));
+
+    F = F(1:Nmax);
+    Y = Y(1:Nmax,:);
+
+    % Normalisation avec les memes moyennes/ecarts-types que N4SID
+    U_id = (F - Scale.uMean) ./ Scale.uStd;
+
+    Y_id = bsxfun(@minus, Y, Scale.yMean);
+    Y_id = bsxfun(@rdivide, Y_id, Scale.yStd);
+
+    Info.Scale = Scale;
+    Info.Fs = Fs;
+    Info.Ts = 1/Fs;
+
+end
