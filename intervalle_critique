@@ -1,0 +1,450 @@
+%% ================================================================
+% ANALYSE TEMPORELLE DES INNOVATIONS e(t)
+% e(t) = y_mesure(t) - y_estime_Kalman(t)
+%
+% Objectif :
+% - analyser les innovations du filtre Kalman
+% - construire un indicateur global d'innovation
+% - definir automatiquement un seuil
+% - detecter les intervalles critiques ou l'innovation est elevee
+%% ================================================================
+
+clear; clc; close all;
+
+%% ================================================================
+% 1. Charger les resultats Kalman
+%% ================================================================
+
+load('C:\Users\pc\Documents\Kalman_results\Kalman_results_from_N4SID.mat');
+
+t = KalmanResults.t(:);
+E = KalmanResults.Innov_phys;   % innovations en unites physiques [N x 6]
+
+ny = size(E,2);
+
+Ts = mean(diff(t));
+Fs = 1/Ts;
+
+fprintf('Nombre de points = %d\n', length(t));
+fprintf('Fs = %.2f Hz\n', Fs);
+fprintf('Duree totale = %.2f s\n', t(end));
+
+% Fenetre pour le RMS glissant
+windowTime    = 0.2;                              % secondes
+windowSamples = max(1, round(windowTime * Fs));
+
+fprintf('Fenetre RMS glissant = %.2f s = %d points\n', windowTime, windowSamples);
+
+%% ================================================================
+% 2. Innovations par capteur - fenetre courte
+%% ================================================================
+
+Tplot   = 5;   % secondes
+idxPlot = t <= Tplot;
+
+figure('Name','Innovation e(t) - fenetre courte','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t(idxPlot), E(idxPlot,i), 'LineWidth', 0.8);
+    yline(0,'--');
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['e_{Acc' num2str(i) '}']);
+    title(['Innovation Acc' num2str(i)]);
+end
+
+sgtitle('Evolution temporelle des innovations e(t)');
+
+%% ================================================================
+% 3. Innovations par capteur - signal complet sous-echantillonne
+%% ================================================================
+
+maxPoints = 8000;
+step      = max(1, floor(length(t)/maxPoints));
+
+t_ds = t(1:step:end);
+E_ds = E(1:step:end,:);
+
+figure('Name','Innovation e(t) - signal complet reduit','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t_ds, E_ds(:,i), 'LineWidth', 0.8);
+    yline(0,'--');
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['e_{Acc' num2str(i) '}']);
+    title(['Innovation Acc' num2str(i) ' - full time']);
+end
+
+sgtitle('Evolution globale des innovations');
+
+%% ================================================================
+% 4. RMS glissant par capteur
+%% ================================================================
+
+E_rms_moving = sqrt(movmean(E.^2, windowSamples, 1));
+
+figure('Name','RMS glissant des innovations','Color','w');
+
+for i = 1:ny
+    subplot(3,2,i);
+
+    plot(t_ds, E_rms_moving(1:step:end,i), 'LineWidth', 1.0);
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel(['RMS e_{Acc' num2str(i) '}']);
+    title(['Moving RMS innovation Acc' num2str(i)]);
+end
+
+sgtitle(['RMS glissant des innovations - fenetre = ' num2str(windowTime) ' s']);
+
+%% ================================================================
+% 5. Indicateur global de l'innovation
+%
+% Chaque innovation est normalisee par son propre RMS.
+% Cela evite qu'un accelerometre domine l'indicateur global.
+%% ================================================================
+
+E_n = zeros(size(E));
+
+for i = 1:ny
+    rms_i = rms(E(:,i));
+
+    if rms_i == 0 || ~isfinite(rms_i)
+        rms_i = 1;
+    end
+
+    E_n(:,i) = E(:,i) ./ rms_i;
+end
+
+% Indicateur global instantane
+E_global = sqrt(sum(E_n.^2, 2));
+
+% Indicateur global lisse
+E_global_RMS = sqrt(movmean(E_global.^2, windowSamples));
+
+%% Figure : innovation globale instantanee + RMS glissant
+
+figure('Name','Indicateur global de l innovation','Color','w');
+
+plot(t_ds, E_global(1:step:end), 'LineWidth', 0.8);
+hold on;
+plot(t_ds, E_global_RMS(1:step:end), 'LineWidth', 1.8);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Indicateur global ||e(t)|| normalise');
+legend('Innovation globale instantanee', 'RMS glissant');
+title('Evolution globale de l''innovation Kalman');
+
+%% Figure : courbe lisse seule
+
+figure('Name','Indicateur global Kalman - courbe lisse','Color','w');
+
+plot(t_ds, E_global_RMS(1:step:end), 'LineWidth', 2);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Global innovation index');
+title('Indicateur global de l''innovation Kalman RMS glissant');
+
+%% ================================================================
+% 6. CALCUL DU SEUIL ROBUSTE
+%
+% Seuil = mediane(I) + 3 * 1.4826 * MAD
+%
+% I = E_global_RMS
+%% ================================================================
+
+I = E_global_RMS(:);
+
+validI = isfinite(I);
+I_valid = I(validI);
+
+% Niveau normal de l'innovation
+medVal = median(I_valid);
+
+% Dispersion robuste
+MAD_val = median(abs(I_valid - medVal));
+
+% Equivalent robuste de l'ecart-type
+sigmaRobust = 1.4826 * MAD_val;
+
+% Seuil
+threshold = medVal + 3 * sigmaRobust;
+
+fprintf('\n===== Calcul du seuil robuste =====\n');
+fprintf('Mediane(I)       = %.4f\n', medVal);
+fprintf('MAD              = %.4f\n', MAD_val);
+fprintf('Sigma robuste    = %.4f\n', sigmaRobust);
+fprintf('Seuil            = %.4f\n', threshold);
+
+%% ================================================================
+% 7. DETECTION DES INTERVALLES CRITIQUES
+%% ================================================================
+
+% Instants ou l'innovation depasse le seuil
+isHigh = I > threshold;
+
+% Detection du debut et de la fin de chaque zone
+d = diff([false; isHigh; false]);
+
+startIdx = find(d == 1);
+endIdx   = find(d == -1) - 1;
+
+% Supprimer les pics trop courts
+minDuration = 0.5;   % secondes
+duration = (endIdx - startIdx + 1) * Ts;
+
+keep = duration >= minDuration;
+
+startIdx = startIdx(keep);
+endIdx   = endIdx(keep);
+duration = duration(keep);
+
+nIntervals = length(startIdx);
+
+IntervalTable = table;
+
+if nIntervals == 0
+
+    disp(' ');
+    disp('Aucun intervalle critique detecte avec ce seuil.');
+    disp('Le modele Kalman reste globalement stable selon ce critere.');
+
+    tStartCritical = NaN;
+    tEndCritical   = NaN;
+    idxCritical    = NaN;
+
+else
+
+    MaxInnovation    = zeros(nIntervals,1);
+    MeanInnovation   = zeros(nIntervals,1);
+    EnergyInnovation = zeros(nIntervals,1);
+
+    for j = 1:nIntervals
+
+        idx = startIdx(j):endIdx(j);
+
+        MaxInnovation(j)    = max(I(idx));
+        MeanInnovation(j)   = mean(I(idx));
+        EnergyInnovation(j) = trapz(t(idx), I(idx).^2);
+
+    end
+
+    IntervalTable.Interval = (1:nIntervals)';
+    IntervalTable.StartTime_s = t(startIdx);
+    IntervalTable.EndTime_s   = t(endIdx);
+    IntervalTable.Duration_s  = duration(:);
+    IntervalTable.MeanInnovation = MeanInnovation;
+    IntervalTable.MaxInnovation  = MaxInnovation;
+    IntervalTable.EnergyInnovation = EnergyInnovation;
+
+    disp(' ');
+    disp('===== Intervalles critiques detectes =====');
+    disp(IntervalTable);
+
+    % Choisir l'intervalle le plus critique
+    % Methode : energie maximale
+    [~, idxCritical] = max(EnergyInnovation);
+
+    tStartCritical = IntervalTable.StartTime_s(idxCritical);
+    tEndCritical   = IntervalTable.EndTime_s(idxCritical);
+
+    fprintf('\nIntervalle critique choisi : %.3f s --> %.3f s\n', ...
+        tStartCritical, tEndCritical);
+
+end
+
+%% ================================================================
+% 8. AFFICHAGE DU SEUIL ET DES INTERVALLES CRITIQUES
+%% ================================================================
+
+figure('Name','Detection des intervalles critiques','Color','w');
+
+% Tracer d'abord les intervalles en arriere-plan
+plot(t, I, 'LineWidth', 1.5);
+hold on;
+
+yline(threshold, '--r', 'Seuil', 'LineWidth', 1.2);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Global innovation index');
+title('Detection des intervalles critiques par seuil');
+
+yl = ylim;
+
+if nIntervals > 0
+
+    for j = 1:nIntervals
+
+        x1 = t(startIdx(j));
+        x2 = t(endIdx(j));
+
+        patch([x1 x2 x2 x1], ...
+              [yl(1) yl(1) yl(2) yl(2)], ...
+              [1 0.80 0.80], ...
+              'FaceAlpha', 0.35, ...
+              'EdgeColor', 'none');
+
+    end
+
+    % Retracer les courbes au-dessus des zones colorees
+    plot(t, I, 'LineWidth', 1.5);
+    yline(threshold, '--r', 'Seuil', 'LineWidth', 1.2);
+
+    % Marquer l'intervalle critique choisi
+    if ~isnan(tStartCritical)
+
+        patch([tStartCritical tEndCritical tEndCritical tStartCritical], ...
+              [yl(1) yl(1) yl(2) yl(2)], ...
+              [1 0.40 0.40], ...
+              'FaceAlpha', 0.25, ...
+              'EdgeColor', 'none');
+
+        plot(t, I, 'LineWidth', 1.5);
+        yline(threshold, '--r', 'Seuil', 'LineWidth', 1.2);
+
+    end
+
+    legend('Innovation globale RMS', 'Seuil', 'Intervalles critiques');
+
+else
+
+    legend('Innovation globale RMS', 'Seuil');
+
+end
+
+%% ================================================================
+% 9. ZOOM SUR L'INTERVALLE CRITIQUE CHOISI
+%% ================================================================
+
+if nIntervals > 0 && ~isnan(tStartCritical)
+
+    margin = 2;   % secondes avant/apres
+
+    t1_zoom = max(t(1), tStartCritical - margin);
+    t2_zoom = min(t(end), tEndCritical + margin);
+
+    idxZoom = t >= t1_zoom & t <= t2_zoom;
+
+    figure('Name','Zoom sur intervalle critique','Color','w');
+
+    plot(t(idxZoom), I(idxZoom), 'LineWidth', 1.8);
+    hold on;
+    yline(threshold, '--r', 'Seuil', 'LineWidth', 1.2);
+
+    yl = ylim;
+
+    patch([tStartCritical tEndCritical tEndCritical tStartCritical], ...
+          [yl(1) yl(1) yl(2) yl(2)], ...
+          [1 0.75 0.75], ...
+          'FaceAlpha', 0.35, ...
+          'EdgeColor', 'none');
+
+    plot(t(idxZoom), I(idxZoom), 'LineWidth', 1.8);
+    yline(threshold, '--r', 'Seuil', 'LineWidth', 1.2);
+
+    grid on;
+    xlabel('Time [s]');
+    ylabel('Global innovation index');
+    title(['Zoom intervalle critique : ' ...
+        num2str(tStartCritical,'%.2f') ' s - ' ...
+        num2str(tEndCritical,'%.2f') ' s']);
+
+    legend('Innovation globale RMS', 'Seuil', 'Intervalle critique');
+
+end
+
+%% ================================================================
+% 10. Statistiques par capteur
+%% ================================================================
+
+InnovationTable = table;
+InnovationTable.Accelerometer = (1:ny)';
+InnovationTable.Mean_e   = mean(E,1,'omitnan').';
+InnovationTable.Std_e    = std(E,0,1,'omitnan').';
+InnovationTable.RMS_e    = rms(E,1).';
+InnovationTable.MaxAbs_e = max(abs(E),[],1).';
+
+disp(' ');
+disp('===== Statistiques des innovations par capteur =====');
+disp(InnovationTable);
+
+%% ================================================================
+% 11. Statistiques de l'indicateur global
+%% ================================================================
+
+GlobalInnovationTable = table;
+GlobalInnovationTable.Mean_Global = mean(E_global,'omitnan');
+GlobalInnovationTable.RMS_Global  = rms(E_global);
+GlobalInnovationTable.Max_Global  = max(E_global);
+
+disp(' ');
+disp('===== Statistiques de l indicateur global =====');
+disp(GlobalInnovationTable);
+
+%% ================================================================
+% 12. Tableau du seuil
+%% ================================================================
+
+ThresholdTable = table;
+ThresholdTable.Median_I = medVal;
+ThresholdTable.MAD = MAD_val;
+ThresholdTable.SigmaRobust = sigmaRobust;
+ThresholdTable.Threshold = threshold;
+ThresholdTable.MinDuration_s = minDuration;
+
+disp(' ');
+disp('===== Parametres du seuil =====');
+disp(ThresholdTable);
+
+%% ================================================================
+% 13. Sauvegarde
+%% ================================================================
+
+InnovationAnalysis.t            = t;
+InnovationAnalysis.E            = E;
+InnovationAnalysis.E_n          = E_n;
+InnovationAnalysis.E_rms_moving = E_rms_moving;
+
+InnovationAnalysis.E_global     = E_global;
+InnovationAnalysis.E_global_RMS = E_global_RMS;
+
+InnovationAnalysis.Threshold = threshold;
+InnovationAnalysis.Median_I = medVal;
+InnovationAnalysis.MAD = MAD_val;
+InnovationAnalysis.SigmaRobust = sigmaRobust;
+InnovationAnalysis.MinDuration_s = minDuration;
+
+InnovationAnalysis.IntervalTable = IntervalTable;
+InnovationAnalysis.tStartCritical = tStartCritical;
+InnovationAnalysis.tEndCritical = tEndCritical;
+InnovationAnalysis.idxCritical = idxCritical;
+
+InnovationAnalysis.InnovationTable = InnovationTable;
+InnovationAnalysis.GlobalInnovationTable = GlobalInnovationTable;
+InnovationAnalysis.ThresholdTable = ThresholdTable;
+
+outDir = fullfile(getenv('USERPROFILE'), 'Documents', 'Kalman_results');
+
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+saveFile = fullfile(outDir, 'Innovation_analysis_Kalman_with_threshold.mat');
+
+save(saveFile, 'InnovationAnalysis', '-v7.3');
+
+fprintf('\nAnalyse des innovations sauvegardee dans :\n%s\n', saveFile);
+
+disp(' ');
+disp('Analyse terminee.');
