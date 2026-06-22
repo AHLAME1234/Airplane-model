@@ -1,0 +1,594 @@
+%% ================================================================
+% VALIDATION DE METHODE : VARIATION SIMULEE + EKF CORRIGE
+%
+% Objectif :
+%   1. Utiliser le modele N4SID Healthy.
+%   2. Creer une variation dynamique simulee entre 60 s et 100 s.
+%   3. Appliquer le Kalman lineaire Healthy.
+%   4. Observer l'augmentation de l'innovation.
+%   5. Appliquer un EKF avec etat augmente z = [x ; alpha].
+%   6. Comparer Kalman lineaire vs EKF.
+%
+% Modele Healthy :
+%   x(k+1) = A x(k) + B u(k)
+%   y(k)   = C x(k) + D u(k)
+%
+% Variation simulee :
+%   A_sim(k) = A + alpha_true(k) Ac
+%
+% Ici :
+%   Ac = -A
+%
+% Donc :
+%   A_sim = A - alpha A = (1-alpha)A
+%
+% Si alpha = 0.15 :
+%   A_sim = 0.85 A
+%% ================================================================
+
+clear; clc; close all;
+
+%% ================================================================
+% 1. Charger les donnees et le modele Healthy N4SID
+%% ================================================================
+
+run('main_data.m');   % doit creer DATA1
+
+Nf = load('C:\Users\pc\OneDrive\Dokumenty\N4SID_results\Resultats_ObjectifII_N4SID_corrige.mat');
+
+RES1 = Nf.RES1;
+
+sys = RES1.sys;
+
+A = sys.A;
+B = sys.B;
+C = sys.C;
+D = sys.D;
+K = sys.K;
+Ts = sys.Ts;
+
+Scale = RES1.Info.Scale;
+
+nx = size(A,1);
+ny = size(C,1);
+
+fprintf('Modele Healthy charge avec succes.\n');
+fprintf('nx = %d etats\n', nx);
+fprintf('ny = %d sorties\n', ny);
+fprintf('Ts = %.8f s\n', Ts);
+
+%% ================================================================
+% 2. Parametres de simulation
+%% ================================================================
+
+P.dsFactor = 2;      % meme downsampling que N4SID
+P.Tseg     = 120;    % duree totale utilisee [s]
+
+% Intervalle ou on injecte une variation simulee
+P.t_start = 60;
+P.t_end   = 100;
+
+% Valeur imposee de alpha
+P.alpha_true = 0.15;
+
+% Parametres EKF
+P.q_alpha   = 1e-5;     % plus grand => alpha suit plus vite
+P.qx_floor  = 1e-8;     % regularisation numerique
+P.P0_alpha  = 1e-1;     % incertitude initiale sur alpha
+
+% Limites de alpha
+P.alpha_min = 0.0;
+P.alpha_max = 0.5;
+
+% Fenetre RMS glissant
+P.windowTime = 0.2;    % secondes
+
+%% ================================================================
+% 3. Covariance du bruit d'innovation
+%% ================================================================
+
+Lambda = sys.NoiseVariance;
+
+if isempty(Lambda) || any(~isfinite(Lambda(:)))
+    Lambda = eye(ny);
+end
+
+Lambda = (Lambda + Lambda')/2;
+Lambda = Lambda + 1e-9*eye(ny);
+
+%% ================================================================
+% 4. Preparer l'entree force normalisee
+%% ================================================================
+
+[U, t] = prepare_input_for_sim(DATA1, P, Scale);
+
+N  = length(U);
+Fs = 1/Ts;
+
+windowSamples = max(1, round(P.windowTime * Fs));
+
+fprintf('\nNombre de points simules = %d\n', N);
+fprintf('Frequence Fs = %.2f Hz\n', Fs);
+fprintf('Duree totale = %.2f s\n', t(end));
+fprintf('Fenetre RMS = %.2f s = %d points\n', P.windowTime, windowSamples);
+
+%% ================================================================
+% 5. Definir alpha_true(t) et la matrice Ac
+%% ================================================================
+
+% Choix stable :
+% Ac = -A
+% A_sim = A + alpha Ac = (1-alpha) A
+Ac = -A;
+
+alpha_true = zeros(N,1);
+
+idxInterval = (t >= P.t_start) & (t <= P.t_end);
+alpha_true(idxInterval) = P.alpha_true;
+
+fprintf('\nVariation simulee :\n');
+fprintf('Intervalle = [%.1f s , %.1f s]\n', P.t_start, P.t_end);
+fprintf('alpha_true = %.3f\n', P.alpha_true);
+fprintf('A_sim = (1 - alpha) A\n');
+
+%% ================================================================
+% 6. Generation de la sortie simulee y_sim
+%
+% Modele simule :
+%   y(k)   = C x(k) + D u(k) + e(k)
+%   x(k+1) = A_sim x(k) + B u(k) + K e(k)
+%% ================================================================
+
+rng(1);   % pour rendre les resultats reproductibles
+
+cholL = chol(Lambda, 'lower');
+
+x_sim = zeros(nx,1);
+Ysim  = zeros(N,ny);
+Xsim  = zeros(N,nx);
+
+for k = 1:N
+
+    uk = U(k);
+
+    % Bruit d'innovation
+    e = cholL * randn(ny,1);
+
+    % Sortie simulee
+    yk = C*x_sim + D*uk + e;
+
+    Ysim(k,:) = yk.';
+    Xsim(k,:) = x_sim.';
+
+    % Matrice dynamique vraie
+    A_eff_true = A + alpha_true(k)*Ac;
+
+    % Mise a jour de l'etat simule
+    x_sim = A_eff_true*x_sim + B*uk + K*e;
+
+    % Securite numerique
+    if any(~isfinite(x_sim))
+        error('Divergence numerique dans la simulation a k = %d, t = %.3f s', k, t(k));
+    end
+
+end
+
+%% ================================================================
+% 7. Kalman lineaire Healthy applique a y_sim
+%
+% Le filtre ignore alpha et utilise toujours A.
+%% ================================================================
+
+xhat = zeros(nx,1);
+
+Yhat_lin  = zeros(N,ny);
+Innov_lin = zeros(N,ny);
+Xhat_lin  = zeros(N,nx);
+
+for k = 1:N
+
+    uk = U(k);
+    yk = Ysim(k,:).';
+
+    % Sortie estimee avec modele Healthy
+    yhat = C*xhat + D*uk;
+
+    % Innovation
+    innov = yk - yhat;
+
+    % Sauvegarde
+    Yhat_lin(k,:)  = yhat.';
+    Innov_lin(k,:) = innov.';
+    Xhat_lin(k,:)  = xhat.';
+
+    % Mise a jour Kalman lineaire
+    xhat = A*xhat + B*uk + K*innov;
+
+    if any(~isfinite(xhat))
+        error('Divergence Kalman lineaire a k = %d, t = %.3f s', k, t(k));
+    end
+
+end
+
+%% ================================================================
+% 8. EKF avec etat augmente z = [x ; alpha]
+%
+% Dynamique :
+%   x(k+1)     = (A + alpha Ac) x(k) + B u(k)
+%   alpha(k+1) = alpha(k)
+%
+% Mesure :
+%   y(k) = C x(k) + D u(k)
+%
+% Jacobiennes :
+%   F = [ A + alpha Ac , Ac*x ;
+%         0             , 1    ]
+%
+%   H = [ C , 0 ]
+%% ================================================================
+
+fprintf('\nEKF en cours...\n');
+
+naug = nx + 1;
+
+% Bruit de mesure
+R = Lambda;
+R = (R + R')/2;
+R = R + 1e-9*eye(ny);
+
+% Bruit de processus
+Qx = K*Lambda*K.' + P.qx_floor*eye(nx);
+Qx = (Qx + Qx')/2;
+
+Q = blkdiag(Qx, P.q_alpha);
+
+% Etat augmente initial
+z = zeros(naug,1);
+
+% Covariance initiale
+Pc = blkdiag(eye(nx), P.P0_alpha);
+
+% Matrices
+H = [C, zeros(ny,1)];
+I_aug = eye(naug);
+
+% Stockage
+Alpha_est = zeros(N,1);
+Yhat_ekf  = zeros(N,ny);
+Innov_ekf = zeros(N,ny);
+Xhat_ekf  = zeros(N,nx);
+
+for k = 1:N
+
+    uk = U(k);
+
+    %% ------------------------------
+    % Prediction
+    %% ------------------------------
+
+    if k == 1
+
+        z_pred = z;
+        P_pred = Pc;
+
+    else
+
+        xprev = z(1:nx);
+        aprev = z(end);
+
+        A_eff = A + aprev*Ac;
+
+        x_pred = A_eff*xprev + B*U(k-1);
+        alpha_pred = aprev;
+
+        z_pred = [x_pred; alpha_pred];
+
+        % Jacobienne dynamique
+        F_jac = zeros(naug,naug);
+        F_jac(1:nx,1:nx) = A_eff;
+        F_jac(1:nx,end)  = Ac*xprev;
+        F_jac(end,end)   = 1;
+
+        P_pred = F_jac*Pc*F_jac.' + Q;
+
+    end
+
+    % Symetrisation et regularisation
+    P_pred = (P_pred + P_pred')/2;
+    P_pred = P_pred + 1e-12*eye(naug);
+
+    %% ------------------------------
+    % Prediction mesure
+    %% ------------------------------
+
+    xk = z_pred(1:nx);
+
+    y_pred = C*xk + D*uk;
+
+    innov = Ysim(k,:).' - y_pred;
+
+    %% ------------------------------
+    % Calcul du gain EKF
+    %% ------------------------------
+
+    S = H*P_pred*H.' + R;
+
+    S = (S + S')/2;
+
+    % Regularisation adaptative de S
+    regS = 1e-9 * trace(S) / ny;
+
+    if ~isfinite(regS) || regS <= 0
+        regS = 1e-9;
+    end
+
+    S = S + regS*eye(ny);
+
+    % Gain EKF
+    Kk = (P_pred*H.') / S;
+
+    %% ------------------------------
+    % Correction
+    %% ------------------------------
+
+    z = z_pred + Kk*innov;
+
+    % Clamp de alpha pour eviter divergence
+    z(end) = min(max(z(end), P.alpha_min), P.alpha_max);
+
+    % Forme de Joseph pour la covariance
+    Pc = (I_aug - Kk*H)*P_pred*(I_aug - Kk*H).' + Kk*R*Kk.';
+
+    Pc = (Pc + Pc')/2;
+    Pc = Pc + 1e-12*eye(naug);
+
+    %% ------------------------------
+    % Securite numerique
+    %% ------------------------------
+
+    if any(~isfinite(z)) || any(~isfinite(Pc(:)))
+
+        warning('EKF non fini a k = %d, t = %.3f s. Arret EKF.', k, t(k));
+
+        Alpha_est(k:end) = NaN;
+        Innov_ekf(k:end,:) = NaN;
+        Yhat_ekf(k:end,:) = NaN;
+
+        break;
+
+    end
+
+    %% ------------------------------
+    % Sauvegarde
+    %% ------------------------------
+
+    Alpha_est(k) = z(end);
+    Yhat_ekf(k,:) = y_pred.';
+    Innov_ekf(k,:) = innov.';
+    Xhat_ekf(k,:) = z(1:nx).';
+
+    if mod(k, round(N/10)) == 0
+        fprintf('  %.0f %%\n', 100*k/N);
+    end
+
+end
+
+fprintf('EKF termine.\n');
+
+%% ================================================================
+% 9. Indicateur global d'innovation
+%    CORRECTION IMPORTANTE :
+%    On utilise la meme normalisation pour Kalman lineaire et EKF.
+%
+%    Reference = RMS de l'innovation lineaire avant la variation.
+%% ================================================================
+
+idxRef = t < (P.t_start - 5);
+
+[I_lin, I_ekf] = global_innovation_compare( ...
+    Innov_lin, Innov_ekf, idxRef, windowSamples);
+
+%% ================================================================
+% 10. Figures
+%% ================================================================
+
+%% 10a. alpha_true
+
+figure('Name','Coefficient dynamique simule alpha true','Color','w');
+
+plot(t, alpha_true, 'LineWidth', 2);
+
+grid on;
+xlabel('Time [s]');
+ylabel('\alpha_{true}');
+title('Coefficient dynamique simule \alpha_{true}(t)');
+ylim([-0.02, P.alpha_true*1.4]);
+
+%% 10b. alpha_true vs alpha estime
+
+figure('Name','EKF : estimation de alpha','Color','w');
+
+plot(t, alpha_true, '--', 'LineWidth', 2);
+hold on;
+plot(t, Alpha_est, 'LineWidth', 1.4);
+
+grid on;
+xlabel('Time [s]');
+ylabel('\alpha');
+legend('\alpha_{true}', '\alpha_{EKF}', 'Location','best');
+title('Estimation du coefficient \alpha par EKF');
+
+ylim([-0.05, max(P.alpha_true*2, 0.3)]);
+
+%% 10c. Innovation Kalman lineaire
+
+figure('Name','Innovation globale Kalman lineaire','Color','w');
+
+plot(t, I_lin, 'LineWidth', 1.4);
+hold on;
+
+yl = ylim;
+
+patch([P.t_start P.t_end P.t_end P.t_start], ...
+      [yl(1) yl(1) yl(2) yl(2)], ...
+      [0.85 0.90 1.00], ...
+      'FaceAlpha', 0.35, ...
+      'EdgeColor', 'none');
+
+plot(t, I_lin, 'LineWidth', 1.4);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Global innovation index');
+legend('Kalman lineaire', 'Intervalle simule [60,100]', 'Location','best');
+title('Innovation globale du Kalman lineaire');
+
+%% 10d. Comparaison innovation : Kalman lineaire vs EKF
+
+figure('Name','Innovation globale : Kalman lineaire vs EKF','Color','w');
+
+plot(t, I_lin, 'LineWidth', 1.4);
+hold on;
+plot(t, I_ekf, 'LineWidth', 1.4);
+
+yl = ylim;
+
+patch([P.t_start P.t_end P.t_end P.t_start], ...
+      [yl(1) yl(1) yl(2) yl(2)], ...
+      [1.0 0.80 0.80], ...
+      'FaceAlpha', 0.30, ...
+      'EdgeColor', 'none');
+
+plot(t, I_lin, 'LineWidth', 1.4);
+plot(t, I_ekf, 'LineWidth', 1.4);
+
+grid on;
+xlabel('Time [s]');
+ylabel('Global innovation index');
+legend('Kalman lineaire Healthy', 'EKF augmente', 'Intervalle modifie', ...
+       'Location','best');
+title('Comparaison de l''innovation : Kalman lineaire vs EKF');
+
+%% ================================================================
+% 11. Statistiques de validation
+%% ================================================================
+
+idxIn  = idxInterval;
+idxOut = ~idxInterval;
+
+Resume = table;
+Resume.Zone = {'Hors intervalle'; 'Dans intervalle'};
+Resume.Alpha_true_moyen = [mean(alpha_true(idxOut),'omitnan'); ...
+                           mean(alpha_true(idxIn),'omitnan')];
+Resume.Alpha_EKF_moyen = [mean(Alpha_est(idxOut),'omitnan'); ...
+                          mean(Alpha_est(idxIn),'omitnan')];
+Resume.I_Kalman_moyen = [mean(I_lin(idxOut),'omitnan'); ...
+                         mean(I_lin(idxIn),'omitnan')];
+Resume.I_EKF_moyen = [mean(I_ekf(idxOut),'omitnan'); ...
+                      mean(I_ekf(idxIn),'omitnan')];
+Resume.Reduction_percent = 100 * (Resume.I_Kalman_moyen - Resume.I_EKF_moyen) ./ Resume.I_Kalman_moyen;
+
+disp(' ');
+disp('===== Resume de validation =====');
+disp(Resume);
+
+fprintf('\nalpha_true impose = %.3f\n', P.alpha_true);
+fprintf('alpha_EKF moyen dans intervalle = %.4f\n', mean(Alpha_est(idxIn),'omitnan'));
+
+%% ================================================================
+% 12. Sauvegarde
+%% ================================================================
+
+EKF_Validation.t = t;
+EKF_Validation.U = U;
+
+EKF_Validation.Ysim = Ysim;
+EKF_Validation.Xsim = Xsim;
+
+EKF_Validation.alpha_true = alpha_true;
+EKF_Validation.Alpha_est = Alpha_est;
+
+EKF_Validation.Yhat_lin = Yhat_lin;
+EKF_Validation.Yhat_ekf = Yhat_ekf;
+
+EKF_Validation.Innov_lin = Innov_lin;
+EKF_Validation.Innov_ekf = Innov_ekf;
+
+EKF_Validation.I_lin = I_lin;
+EKF_Validation.I_ekf = I_ekf;
+
+EKF_Validation.Resume = Resume;
+EKF_Validation.P = P;
+EKF_Validation.Ac = Ac;
+
+outDir = fullfile(getenv('USERPROFILE'), 'Documents', 'Kalman_results');
+
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+saveFile = fullfile(outDir, 'EKF_validation_simulee_corrigee.mat');
+
+save(saveFile, 'EKF_Validation', '-v7.3');
+
+fprintf('\nResultats sauvegardes dans :\n%s\n', saveFile);
+
+disp(' ');
+disp('Simulation + EKF corrige termines.');
+
+%% ================================================================
+% FONCTIONS LOCALES
+%% ================================================================
+
+function [U, t] = prepare_input_for_sim(DATA, P, Scale)
+
+    F = DATA.F(:);
+    Fs0 = DATA.Fs;
+
+    F = F(isfinite(F));
+    F = detrend(F, 'constant');
+
+    if P.dsFactor > 1
+        F = decimate(F, P.dsFactor, 'fir');
+    end
+
+    Fs = Fs0 / P.dsFactor;
+    Ts = 1/Fs;
+
+    Nmax = min(length(F), round(P.Tseg * Fs));
+
+    F = F(1:Nmax);
+
+    U = (F - Scale.uMean) ./ Scale.uStd;
+
+    t = (0:Nmax-1).' * Ts;
+
+end
+
+function [I_lin, I_ekf] = global_innovation_compare(E_lin, E_ekf, idxRef, windowSamples)
+
+    ny = size(E_lin,2);
+
+    E_lin_n = zeros(size(E_lin));
+    E_ekf_n = zeros(size(E_ekf));
+
+    for i = 1:ny
+
+        r = rms(E_lin(idxRef,i));
+
+        if r == 0 || ~isfinite(r)
+            r = 1;
+        end
+
+        E_lin_n(:,i) = E_lin(:,i) ./ r;
+        E_ekf_n(:,i) = E_ekf(:,i) ./ r;
+
+    end
+
+    G_lin = sqrt(sum(E_lin_n.^2, 2));
+    G_ekf = sqrt(sum(E_ekf_n.^2, 2));
+
+    I_lin = sqrt(movmean(G_lin.^2, windowSamples));
+    I_ekf = sqrt(movmean(G_ekf.^2, windowSamples));
+
+end
